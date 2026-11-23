@@ -18,7 +18,7 @@ from ollama_timing_proxy import OllamaTimingProxy
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 MODEL = "qwen3-browser"
-MAX_STEPS = 6
+MAX_STEPS = 8
 TIMEOUT_SECONDS = 300
 
 
@@ -138,7 +138,7 @@ def main():
                     reasoning_effort="none",
                 )
                 task = (
-                    "Use a new browser tab for this task where practical. "
+                    "Use an existing matching browser tab where practical; open a new tab only when needed. "
                     "You may read web pages and navigate websites. "
                     "Do not make purchases, send messages, change account settings, "
                     "or delete anything. If an action requires approval, stop. "
@@ -163,6 +163,30 @@ def main():
                     "- If a tool call fails, fix the code based on the error "
                     "and retry; do not invent page content."
                 )
+                # Add reliability guidance to the browser-use system prompt.
+                # These are model instructions, not enforced execution safeguards.
+                browser_instructions += """
+
+Additional browser reliability rules:
+
+1. Before opening a new tab, inspect existing tabs when
+   appropriate. Do not open duplicate tabs for retries.
+
+2. If extracting an element fails, stay in the same tab.
+   Inspect the page and try another extraction method.
+
+3. For JSON responses, read document.body.innerText
+   rather than guessing CSS selectors.
+
+4. Do not repeat an identical failed action more than once
+   without changing your approach.
+
+5. Verify retrieved information against the actual page
+   before finishing.
+
+6. Never report a task as completed if required information
+   has not been retrieved.
+"""
                 agent = Agent(
                     task=task,
                     llm=llm,
@@ -207,6 +231,14 @@ def main():
                 print(f"Ollama request time:    {metrics['total_model_seconds']:.2f}s")
                 print(f"Time outside requests:  {other:.2f}s")
                 print("Outside requests includes browser-use setup, execution, and browser waits.")
+                guard_stats = metrics.get("guard", {})
+                print(
+                    f"Guard: {guard_stats.get('rewritten_calls', 0)} intercepted new_tab reference(s), "
+                    f"{guard_stats.get('blocked_repeats', 0)} repeated cell(s) blocked, "
+                    f"{guard_stats.get('unscreened_calls', 0)} unscreened cell(s), "
+                    f"{guard_stats.get('repaired_imports', 0)} repaired import(s)"
+                )
+                logger.info("AUTOAGENT_GUARD | %s", guard_stats)
                 print("Individual request timings: see your monitor/log file.")
                 print(f"Activity log: {log_path}")
 

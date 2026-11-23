@@ -13,6 +13,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+from browser_reliability import BrowserActionGuard
+
 LOG = logging.getLogger("autoagent")
 
 
@@ -103,6 +105,7 @@ class OllamaTimingProxy:
         self._lock = threading.Lock()
         self._records = []
         self._next_id = 0
+        self.guard = BrowserActionGuard()
         proxy = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -193,32 +196,68 @@ class OllamaTimingProxy:
                     response = upstream.getresponse()
                     status = response.status
                     stream_response = 'text/event-stream' in (response.getheader('Content-Type', '') or '').lower()
-                    self.send_response(status)
-                    hop_headers = {
-                        "connection", "keep-alive", "proxy-authenticate",
-                        "proxy-authorization", "te", "trailer", "transfer-encoding",
-                        "upgrade", "content-length"
-                    }
-                    for key, val in response.getheaders():
-                        if key.lower() not in hop_headers:
-                            self.send_header(key, val)
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    self.close_connection = True
-
-                    # read1 avoids buffering an entire streaming response before
-                    # relaying the first token/chunk to browser-use.
-                    while True:
-                        chunk = response.read1(8192)
-                        if not chunk:
-                            break
-                        if first_byte_at is None:
-                            first_byte_at = time.perf_counter()
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                        bytes_out += len(chunk)
-                        if is_model_call and len(captured) < capture_limit:
-                            captured.extend(chunk[:capture_limit - len(captured)])
+                    # Buffer only non-streaming chat completions so a duplicate
+                    # new_tab tool call can be blocked BEFORE REPL execution.
+                    # The user's browser-use requests have stream=False.
+                    guarded = is_model_call and route == "/v1/chat/completions" and status == 200
+                    max_guard_bytes = 2_000_000
+                    if guarded:
+                        if stream_response:
+                            # Fail closed instead of silently bypassing the guard.
+                            self._reply_error(502, "Guard requires non-streaming chat completions")
+                            bytes_out = 0
+                            error = "Guard blocked streaming tool response"
+                        else:
+                            chunks = []
+                            total = 0
+                            while True:
+                                chunk = response.read1(8192)
+                                if not chunk:
+                                    break
+                                if first_byte_at is None:
+                                    first_byte_at = time.perf_counter()
+                                total += len(chunk)
+                                if total > max_guard_bytes:
+                                    raise ValueError("Model response exceeds guard inspection limit")
+                                chunks.append(chunk)
+                            original = b"".join(chunks)
+                            forwarded, notices = proxy.guard.filter_chat_completion(original)
+                            for notice in notices:
+                                LOG.warning("BROWSER_GUARD | %s", notice)
+                            self.send_response(status)
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Content-Length", str(len(forwarded)))
+                            self.send_header("Connection", "close")
+                            self.end_headers()
+                            self.close_connection = True
+                            self.wfile.write(forwarded)
+                            self.wfile.flush()
+                            bytes_out = len(forwarded)
+                            captured.extend(forwarded[:capture_limit])
+                    else:
+                        self.send_response(status)
+                        hop_headers = {
+                            "connection", "keep-alive", "proxy-authenticate",
+                            "proxy-authorization", "te", "trailer", "transfer-encoding",
+                            "upgrade", "content-length"
+                        }
+                        for key, val in response.getheaders():
+                            if key.lower() not in hop_headers:
+                                self.send_header(key, val)
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        self.close_connection = True
+                        while True:
+                            chunk = response.read1(8192)
+                            if not chunk:
+                                break
+                            if first_byte_at is None:
+                                first_byte_at = time.perf_counter()
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                            bytes_out += len(chunk)
+                            if is_model_call and len(captured) < capture_limit:
+                                captured.extend(chunk[:capture_limit - len(captured)])
                 except (BrokenPipeError, ConnectionResetError) as exc:
                     error = f"Client disconnected: {type(exc).__name__}"
                 except Exception as exc:
@@ -276,4 +315,5 @@ class OllamaTimingProxy:
             "calls": len(records),
             "total_model_seconds": sum(r["seconds"] for r in records),
             "records": records,
+            "guard": self.guard.summary(),
         }
